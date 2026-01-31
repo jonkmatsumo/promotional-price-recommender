@@ -210,7 +210,12 @@ class UpliftMetrics:
             AUUC score
         """
         # Area under model curve
-        auuc = np.trapz(qini_y, qini_x)
+        try:
+            # For numpy >= 2.0
+            auuc = np.trapezoid(qini_y, qini_x)
+        except AttributeError:
+            # For numpy < 2.0 (fallback)
+            auuc = np.trapz(qini_y, qini_x)
 
         if normalize:
             # Area under random (diagonal) baseline
