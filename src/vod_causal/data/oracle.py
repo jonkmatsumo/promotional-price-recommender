@@ -254,8 +254,6 @@ class CausalOracle:
                 revenue = offered_price
             else:
                 revenue = 0.0
-            else:
-                revenue = 0.0
             result["revenue"] = revenue
 
         return result
