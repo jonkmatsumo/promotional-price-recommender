@@ -115,24 +115,23 @@ class TreatmentLog:
 
     user_id: str
     title_id: str
-    discount_level: float
+    offered_price: float
     campaign_id: str
     timestamp: datetime
 
-    # Valid discount levels
-    VALID_DISCOUNT_LEVELS: List[float] = field(
-        default_factory=lambda: [0.0, 0.1, 0.2, 0.3], repr=False
-    )
-
     def __post_init__(self):
         """Validate fields after initialization."""
-        if self.discount_level < 0 or self.discount_level > 1:
-            raise ValueError(f"discount_level must be in [0, 1]: {self.discount_level}")
+        if self.offered_price < 0:
+            raise ValueError(f"offered_price must be >= 0: {self.offered_price}")
 
     @property
     def is_treated(self) -> bool:
-        """Return True if this is an actual treatment (discount > 0)."""
-        return self.discount_level > 0
+        """Return True if this is an actual treatment (price < base_price)."""
+        # Assuming base price is roughly 4.99, treated if < 4.99
+        # In practice, we should check against the specific title's base price,
+        # but for this schema property, we'll assume any specific offer check is done elsewhere.
+        # Ideally, we just check if a campaign_id is present.
+        return self.campaign_id != "NO_TREATMENT"
 
 
 @dataclass

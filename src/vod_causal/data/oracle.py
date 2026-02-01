@@ -70,76 +70,64 @@ class CausalOracle:
         self.rng = np.random.default_rng(seed)
         self.noise_scale = noise_scale
 
-    def calculate_true_lift(
+    def calculate_elasticity(
         self,
         user_features: Dict,
         item_features: Dict,
-        discount_level: float = 0.1,
     ) -> float:
         """
-        Calculate the true treatment effect (uplift) for a user-item pair.
-
-        The true lift is a deterministic function of user and item features,
-        modulated by the discount level. This represents the hidden causal
-        effect that our models attempt to estimate.
-
-        **Causal Structure (Hidden from Models):**
-        - Base lift from promotion
-        - Genre-specific bonus (e.g., Sci-Fi fans respond more)
-        - Region-specific bonus (price sensitivity varies)
-        - Tenure modifier (log relationship with subscription length)
-        - Device modifier
-        - Discount level amplifier
-
+        Calculate the price elasticity ($\epsilon$) for a user-item pair.
+        
+        Elasticity defines how demand changes with price:
+        $Demand(P) = Demand(P_0) * (1 + \epsilon * (P - P_0))$
+        
+        Note: We model this as a negative slope coefficient (semi-elasticity-like).
+        A more negative value means MORE sensitive to price increases.
+        
         Args:
             user_features: Dict with keys: geo_region, tenure, device_type, price_sensitivity
             item_features: Dict with keys: genre, popularity
-            discount_level: The discount being offered (0.0 to 0.3)
-
+            
         Returns:
-            The true conditional average treatment effect (CATE) in probability units
+            Elasticity coefficient (negative value).
+            e.g., -0.2 means 1$ increase -> 20% drop in probability.
         """
-        # Base lift that everyone gets from seeing a promotion
-        base_lift = 0.05
+        # Base elasticity (negative)
+        base_elasticity = -0.15
 
-        # Genre-specific effect
-        genre = item_features.get("genre", "Drama")
-        genre_bonus = self._GENRE_EFFECTS.get(genre, 0.05)
+        # Feature effects
+        # 1. User sensitivity (latent)
+        sensitivity = user_features.get("price_sensitivity", 0.5)
+        # High sensitivity -> more negative elasticity
+        sens_effect = -0.2 * sensitivity 
 
-        # Geographic effect (price sensitivity varies by region)
-        region = user_features.get("geo_region", "US")
-        region_bonus = self._REGION_EFFECTS.get(region, 0.05)
+        # 2. Tenure
+        # Long tenure (> 12 mo) -> Less sensitive (closer to 0)
+        tenure = user_features.get("tenure", 0)
+        tenure_effect = 0.05 * np.log1p(tenure / 12)
 
-        # Tenure interaction: longer-tenured users are less responsive to promotions
-        # (they know what they want), but there's a sweet spot
-        tenure = user_features.get("tenure", 12)
-        tenure_modifier = 0.02 * np.log1p(tenure) - 0.005 * np.log1p(max(0, tenure - 24))
+        # 3. Peak Demand (Proxy via Watch Time)
+        # High watch time -> Less sensitive
+        watch_time = user_features.get("avg_daily_watch_time", 60)
+        usage_effect = 0.05 * (watch_time / 100)
 
-        # Device effect
-        device = user_features.get("device_type", "Desktop")
-        device_bonus = self._DEVICE_EFFECTS.get(device, 0.03)
+        # 4. Content Popularity
+        # Popular content -> Less sensitive
+        popularity = item_features.get("popularity", 0.5)
+        pop_effect = 0.05 * popularity
 
-        # Price sensitivity amplifier (more sensitive users respond more to discounts)
-        price_sensitivity = user_features.get("price_sensitivity", 0.5)
-        sensitivity_amplifier = 0.5 + price_sensitivity  # Range: [0.5, 1.5]
-
-        # Discount level amplifier (higher discounts = higher lift, diminishing returns)
-        discount_amplifier = 1.0 + 2.0 * np.sqrt(discount_level)
-
-        # Combine all effects
-        raw_lift = (
-            base_lift
-            + genre_bonus
-            + region_bonus
-            + tenure_modifier
-            + device_bonus
+        # Combine
+        total_elasticity = (
+            base_elasticity + 
+            sens_effect + 
+            tenure_effect + 
+            usage_effect + 
+            pop_effect
         )
-
-        # Apply amplifiers
-        total_lift = raw_lift * sensitivity_amplifier * discount_amplifier
-
-        # Clip to reasonable range
-        return np.clip(total_lift, 0.0, 0.5)
+        
+        # Ensure it's always negative (Price up -> Demand down)
+        # Cap at -0.01 (min sensitivity) and -0.8 (max sensitivity)
+        return np.clip(total_elasticity, -0.8, -0.01)
 
     def _compute_base_probability(
         self,
@@ -194,113 +182,76 @@ class CausalOracle:
         """Apply sigmoid function with numerical stability."""
         return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
 
-    def compute_potential_outcomes(
+    def compute_demand(
         self,
         user_features: Dict,
         item_features: Dict,
-        discount_level: float = 0.1,
-    ) -> Tuple[float, float]:
+        price: float,
+    ) -> float:
         """
-        Compute Y(0) and Y(1) - the potential outcomes.
-
-        This is the fundamental causal inference quantity: what would happen
-        under control vs treatment. In real data, we only observe one of these;
-        the oracle lets us see both for validation.
-
+        Compute demand probability at a specific price.
+        
         Args:
             user_features: User characteristics
             item_features: Item characteristics
-            discount_level: Discount level for treatment arm
-
+            price: Offered price
+            
         Returns:
-            Tuple of (y0, y1):
-                y0: Control outcome (probability of conversion without discount)
-                y1: Treatment outcome (probability of conversion with discount)
+            Probability of purchase (0-1)
         """
-        # Base probability (in log-odds space)
+        base_price = item_features.get("base_price", 4.99)
+        
+        # Base probability at standard price
         base_logit = self._compute_base_probability(user_features, item_features)
-
-        # Add noise (same noise for both potential outcomes - individual heterogeneity)
-        noise = self.rng.normal(0, self.noise_scale)
-
-        # Y(0): Control outcome - no treatment effect
-        y0 = self._sigmoid(base_logit + noise)
-
-        # Y(1): Treatment outcome - includes true lift (converted to log-odds)
-        true_lift = self.calculate_true_lift(user_features, item_features, discount_level)
-        # Convert lift to log-odds addition (approximate)
-        lift_logit = np.log((y0 + true_lift) / (1 - y0 - true_lift + 1e-10) + 1e-10) - np.log(
-            y0 / (1 - y0 + 1e-10) + 1e-10
-        )
-        y1 = self._sigmoid(base_logit + lift_logit + noise)
-
-        # Ensure valid probabilities
-        y0 = np.clip(y0, 0.001, 0.999)
-        y1 = np.clip(y1, 0.001, 0.999)
-
-        return float(y0), float(y1)
+        base_prob = self._sigmoid(base_logit)
+        
+        # Calculate elasticity
+        elasticity = self.calculate_elasticity(user_features, item_features)
+        
+        # Demand Curve Formula (Linear Log-Odds approximation or Linear Probability)
+        # Let's use a robust linear probability adjustment clipped to [0,1]
+        # P(p) = P(base) + \epsilon * (p - base_price)
+        
+        price_delta = price - base_price
+        
+        # Effect on probability
+        prob_delta = elasticity * price_delta
+        
+        # New probability
+        final_prob = np.clip(base_prob + prob_delta, 0.01, 0.99)
+        
+        return final_prob, elasticity
 
     def compute_observed_outcome(
         self,
         user_features: Dict,
         item_features: Dict,
         is_treated: bool,
-        discount_level: float = 0.1,
+        offered_price: float,
         return_revenue: bool = True,
     ) -> Dict:
         """
-        Compute the observed outcome based on treatment assignment.
-
-        This simulates what we actually observe in data: only the outcome
-        under the assigned treatment condition.
-
-        Args:
-            user_features: User characteristics
-            item_features: Item characteristics
-            is_treated: Whether this observation received treatment
-            discount_level: Discount level (only used if is_treated=True)
-            return_revenue: If True, also compute revenue
-
-        Returns:
-            Dict with:
-                - did_rent: Binary conversion outcome
-                - conversion_prob: Underlying probability
-                - revenue: Revenue generated (if return_revenue=True)
-                - true_cate: The true causal effect (for validation)
-                - y0, y1: Potential outcomes (for validation)
+        Compute the observed outcome based on offered price.
         """
-        # Compute potential outcomes
-        y0, y1 = self.compute_potential_outcomes(
-            user_features, item_features, discount_level
+        # Compute demand probability at offered price
+        true_prob, true_elasticity = self.compute_demand(
+            user_features, item_features, offered_price
         )
-
-        # Select observed probability based on treatment
-        if is_treated:
-            conversion_prob = y1
-        else:
-            conversion_prob = y0
-
-        # Simulate binary outcome
-        did_rent = self.rng.random() < conversion_prob
-
-        # Compute true CATE (for validation only - not observable in real world)
-        true_cate = self.calculate_true_lift(user_features, item_features, discount_level)
+        
+        # Add random noise to decision
+        # We do this by sampling from the probability
+        did_rent = self.rng.random() < true_prob
 
         result = {
             "did_rent": did_rent,
-            "conversion_prob": conversion_prob,
-            "true_cate": true_cate,
-            "y0": y0,
-            "y1": y1,
+            "demand_at_price": true_prob,
+            "true_elasticity": true_elasticity,
         }
 
         if return_revenue:
             base_price = item_features.get("base_price", 4.99)
             if did_rent:
-                if is_treated:
-                    revenue = base_price * (1 - discount_level)
-                else:
-                    revenue = base_price
+                revenue = offered_price
             else:
                 revenue = 0.0
             result["revenue"] = revenue

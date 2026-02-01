@@ -216,7 +216,7 @@ class VODSyntheticData:
             title_row: Title metadata
 
         Returns:
-            Tuple of (is_treated, discount_level, campaign_id)
+            Tuple of (is_treated, offered_price, campaign_id)
         """
         # Base probability of treatment
         base_prob = self.treatment_probability
@@ -233,18 +233,43 @@ class VODSyntheticData:
         # - Less popular titles
         base_prob += 0.05 * (1 - title_row["base_popularity"])
 
+        # NEW CONFOUNDING: "Peak Demand" bias
+        # Simulate that high-demand users (high watch time) rarely get valid discounts
+        # or get higher "discounted" prices.
+        avg_watch = user_row["avg_daily_watch_time"]
+        if avg_watch > 80:
+             # High usage users get treated LESS often
+            base_prob -= 0.15
+
         # Sample treatment
         is_treated = self.rng.random() < np.clip(base_prob, 0.05, 0.5)
+        
+        base_price = 4.99
 
         if is_treated:
-            # Sample discount level (10%, 20%, 30%)
-            discount_level = self.rng.choice([0.1, 0.2, 0.3], p=[0.5, 0.35, 0.15])
+            # Continuous pricing:
+            # Random discount between 5% and 40%
+            # But influenced by watch time (confounding)
+            
+            # Base discount
+            discount_pct = self.rng.uniform(0.05, 0.40)
+            
+            # Confounding: High watch time users get smaller discounts
+            if avg_watch > 60:
+                discount_pct *= 0.7  # Reduce discount
+
+            # Calculate price
+            offered_price = base_price * (1 - discount_pct)
+            
+            # Round to nice numbers like X.99 or X.49
+            offered_price = np.round(offered_price * 2) / 2 - 0.01
+            
             campaign_id = self.rng.choice(self.campaign_ids)
         else:
-            discount_level = 0.0
+            offered_price = base_price
             campaign_id = "NO_TREATMENT"
 
-        return is_treated, discount_level, campaign_id
+        return is_treated, float(max(0.99, offered_price)), campaign_id
 
     def generate_interactions(
         self,
@@ -297,7 +322,7 @@ class VODSyntheticData:
             title_row = titles_df[titles_df["title_id"] == title_id].iloc[0]
 
             # Sample treatment assignment
-            is_treated, discount_level, campaign_id = self._sample_treatment(
+            is_treated, offered_price, campaign_id = self._sample_treatment(
                 user_row, title_row
             )
 
@@ -325,7 +350,7 @@ class VODSyntheticData:
                 user_features=user_features,
                 item_features=item_features,
                 is_treated=is_treated,
-                discount_level=discount_level if is_treated else 0.0,
+                offered_price=offered_price,
                 return_revenue=True,
             )
 
@@ -338,10 +363,9 @@ class VODSyntheticData:
             treatment_logs.append({
                 "user_id": user_id,
                 "title_id": title_id,
-                "discount_level": discount_level,
+                "offered_price": offered_price,
                 "campaign_id": campaign_id,
                 "timestamp": timestamp,
-                "is_treated": is_treated,
             })
 
             # Create outcome entry
@@ -352,10 +376,10 @@ class VODSyntheticData:
                 "revenue_generated": outcome["revenue"],
                 "watch_duration_minutes": watch_duration,
                 "base_price": 4.99,
+                "base_price": 4.99,
                 # Ground truth for validation (not available in real data!)
-                "true_cate": outcome["true_cate"],
-                "y0": outcome["y0"],
-                "y1": outcome["y1"],
+                "true_elasticity": outcome["true_elasticity"],
+                "demand_at_price": outcome["demand_at_price"],
             })
 
         treatment_df = pd.DataFrame(treatment_logs)
@@ -390,10 +414,10 @@ class VODSyntheticData:
             "n_users": len(users_df),
             "n_titles": len(titles_df),
             "n_interactions": len(outcomes_df),
-            "treatment_rate": treatment_df["is_treated"].mean(),
+            "treatment_rate": treatment_df["campaign_id"].apply(lambda x: x != "NO_TREATMENT").mean(),
             "conversion_rate": outcomes_df["did_rent"].mean(),
             "avg_revenue": outcomes_df["revenue_generated"].mean(),
-            "avg_true_cate": outcomes_df["true_cate"].mean(),
+            "avg_price": treatment_df["offered_price"].mean(),
             "cold_start_titles": titles_df["is_cold_start"].sum(),
         }
 

@@ -297,17 +297,33 @@ class PolicyRanker:
         Returns:
             Dict with multiple summary DataFrames
         """
+        # Determine columns to merge from title_metadata
+        cols_to_merge = ["title_id"]
+        for col in ["genre", "director"]:
+            if col not in recommendations.columns and col in title_metadata.columns:
+                cols_to_merge.append(col)
+        
         # Merge with metadata
-        recs = recommendations.merge(
-            title_metadata[["title_id", "genre", "director"]],
-            on="title_id",
-            how="left"
-        )
-        recs = recs.merge(
-            user_metadata[["user_id", "geo_region", "device_type"]],
-            on="user_id",
-            how="left"
-        )
+        if len(cols_to_merge) > 1:
+            recs = recommendations.merge(
+                title_metadata[cols_to_merge],
+                on="title_id",
+                how="left"
+            )
+        else:
+            recs = recommendations.copy()
+        # Determine columns to merge from user_metadata
+        user_cols_to_merge = ["user_id"]
+        for col in ["geo_region", "device_type"]:
+            if col not in recs.columns and col in user_metadata.columns:
+                user_cols_to_merge.append(col)
+
+        if len(user_cols_to_merge) > 1:
+            recs = recs.merge(
+                user_metadata[user_cols_to_merge],
+                on="user_id",
+                how="left"
+            )
 
         # Summary by genre
         genre_summary = recs.groupby("genre").agg({
